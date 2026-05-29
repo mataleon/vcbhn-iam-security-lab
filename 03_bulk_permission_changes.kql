@@ -1,0 +1,97 @@
+// ============================================================
+// VCBHN IAM Detection | Rule: New Admin Account Outside Change Window
+// ============================================================
+// Description:
+//   Detects when a new account is created AND immediately
+//   assigned an admin-level role — outside of the approved
+//   change window. Creating a privileged account after hours
+//   is a high-fidelity indicator of:
+//     - Backdoor account creation by insider threat
+//     - Persistence mechanism post-compromise (T1136)
+//     - Unauthorized privileged access provisioning
+//
+//   In a HIPAA environment this is especially critical as a
+//   new admin account could immediately access PHI systems
+//   without going through access certification.
+//
+// Severity:      CRITICAL
+// MITRE ATT&CK:  T1136.003 — Create Cloud Account
+//                T1078.004 — Valid Accounts: Cloud Accounts
+// HIPAA Control: §164.308(a)(3) — Workforce Access Management
+//                §164.312(a)(1) — Access Control
+// NIST SP 800-66: AC-2 | AC-6 | IR-4
+//
+// Trigger:       New account created + admin role assigned
+//                within 30 minutes, outside change window
+// Response:      Disable account immediately. Verify with HR
+//                and IT Director. Treat as incident until
+//                business justification is confirmed.
+// ============================================================
+
+let ChangeWindowStart = 8;
+let ChangeWindowEnd   = 17;
+let CorrelationWindow = 30m;
+
+let AdminRoles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "User Account Administrator",
+    "Security Administrator",
+    "Exchange Administrator",
+    "SharePoint Administrator",
+    "Intune Administrator"
+]);
+
+// Step 1: Find new account creation events
+let NewAccounts =
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName == "Add user"
+    | where Result == "success"
+    | extend
+        NewUserUPN   = tostring(TargetResources[0].userPrincipalName),
+        CreatedBy    = tostring(InitiatedBy.user.userPrincipalName),
+        CreationTime = TimeGenerated,
+        HourPST      = (datetime_part("Hour", TimeGenerated) + 24 - 8) % 24,
+        DayOfWeek    = dayofweek(TimeGenerated) / 1d
+    | project NewUserUPN, CreatedBy, CreationTime, HourPST, DayOfWeek;
+
+// Step 2: Find admin role assignment events
+let AdminAssignments =
+    AuditLogs
+    | where TimeGenerated > ago(24h)
+    | where OperationName == "Add member to role"
+    | where Result == "success"
+    | extend
+        AssignedUser = tostring(TargetResources[0].userPrincipalName),
+        AssignedRole = tostring(TargetResources[0].displayName),
+        AssignedBy   = tostring(InitiatedBy.user.userPrincipalName),
+        AssignTime   = TimeGenerated
+    | where AssignedRole in (AdminRoles)
+    | project AssignedUser, AssignedRole, AssignedBy, AssignTime;
+
+// Step 3: Correlate — new account + admin role within 30 minutes
+NewAccounts
+| join kind=inner AdminAssignments on $left.NewUserUPN == $right.AssignedUser
+| where AssignTime between (CreationTime .. (CreationTime + CorrelationWindow))
+| extend
+    MinutesToElevation = datetime_diff('minute', AssignTime, CreationTime),
+    IsAfterHours = (HourPST < ChangeWindowStart or HourPST >= ChangeWindowEnd or DayOfWeek in (0, 6))
+| where IsAfterHours == true
+| project
+    AlertTime          = CreationTime,
+    NewAccount         = NewUserUPN,
+    CreatedBy,
+    AdminRoleAssigned  = AssignedRole,
+    AssignedBy,
+    AssignTime,
+    MinutesToElevation,
+    HourPST,
+    DayOfWeek
+| extend
+    Severity          = "CRITICAL",
+    RuleName          = "New Admin Account Created Outside Change Window",
+    HIPAAControl      = "§164.308(a)(3) | §164.312(a)(1)",
+    MITRETechnique    = "T1136.003 / T1078.004",
+    RecommendedAction = "DISABLE account immediately. Do not wait for investigation. Notify IT Director, HIPAA Security Officer, and HR. Open P1 incident."
+| order by AlertTime desc

@@ -1,0 +1,68 @@
+// ============================================================
+// VCBHN IAM Detection | Rule: Stale Account PHI Access
+// ============================================================
+// Description:
+//   Detects user accounts that have been inactive for 90+ days
+//   but are still accessing PHI-bearing systems. In a HIPAA-
+//   regulated environment this indicates a failure in access
+//   lifecycle management and must be reviewed immediately.
+//
+// Severity:      CRITICAL
+// MITRE ATT&CK:  T1078 — Valid Accounts
+// HIPAA Control: §164.308(a)(3) — Workforce Access Management
+// NIST SP 800-66: AC-2 Account Management
+//
+// Trigger:       Any PHI system access by account inactive 90d+
+// Response:      Suspend account, initiate access review,
+//                notify manager and HIPAA Security Officer
+// ============================================================
+
+let StaleThresholdDays = 90;
+let PHISystems = dynamic([
+    "EHR-PROD", "EPIC-PROD", "LAB-RESULTS", "RADIOLOGY-PACS",
+    "PHARMACY-RX", "BEHAVIORAL-HEALTH-EHR", "PATIENT-PORTAL-ADMIN"
+]);
+
+// Get accounts with no login in 90+ days
+let StaleAccounts =
+    AuditLogs
+    | where TimeGenerated > ago(90d)
+    | where OperationName == "Sign-in activity"
+    | summarize LastLogin = max(TimeGenerated) by UserPrincipalName
+    | where LastLogin < ago(StaleThresholdDays * 1d)
+    | project UserPrincipalName, LastLogin,
+              DaysSinceLogin = datetime_diff('day', now(), LastLogin);
+
+// Get recent access events to PHI systems
+let RecentPHIAccess =
+    SigninLogs
+    | where TimeGenerated > ago(24h)
+    | where AppDisplayName in (PHISystems)
+    | where ResultType == 0  // Successful sign-in only
+    | project
+        TimeGenerated,
+        UserPrincipalName,
+        AppDisplayName,
+        IPAddress,
+        Location,
+        UserAgent = tostring(DeviceDetail.browser);
+
+// Join — stale accounts that accessed PHI today
+StaleAccounts
+| join kind=inner RecentPHIAccess on UserPrincipalName
+| project
+    AlertTime       = TimeGenerated,
+    UserPrincipalName,
+    PHISystem       = AppDisplayName,
+    IPAddress,
+    Location,
+    DaysSinceLogin,
+    LastKnownLogin  = LastLogin,
+    UserAgent
+| extend
+    Severity        = "CRITICAL",
+    RuleName        = "Stale Account Accessing PHI System",
+    HIPAAControl    = "§164.308(a)(3)",
+    RecommendedAction = "Suspend account immediately. Notify manager and HIPAA Security Officer. Document in incident log.",
+    MITRETechnique  = "T1078 - Valid Accounts"
+| order by DaysSinceLogin desc

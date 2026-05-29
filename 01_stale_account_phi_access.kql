@@ -1,0 +1,71 @@
+// ============================================================
+// VCBHN IAM Detection | Rule: After-Hours Privilege Escalation
+// ============================================================
+// Description:
+//   Detects role or group membership changes performed outside
+//   of approved change windows (Mon–Fri 08:00–17:00 PST).
+//   Privilege changes after hours are a strong indicator of
+//   insider threat, compromised admin account, or unauthorized
+//   access expansion in a healthcare environment.
+//
+// Severity:      HIGH
+// MITRE ATT&CK:  T1078.004 — Cloud Accounts
+//                T1098     — Account Manipulation
+// HIPAA Control: §164.312(a)(1) — Access Control
+// NIST SP 800-66: AC-6 Least Privilege | AU-2 Audit Events
+//
+// Trigger:       Any role/group assignment outside change window
+// Response:      Page on-call security analyst, verify with
+//                change manager, revert if unauthorized
+// ============================================================
+
+// Define approved change window (Mon=1 through Fri=5, 08:00–17:00 PST)
+let ChangeWindowStart = 8;   // 08:00 local
+let ChangeWindowEnd   = 17;  // 17:00 local
+let WeekendDays       = dynamic([0, 6]);  // Sunday=0, Saturday=6
+
+// Privilege-relevant operations
+let PrivilegeOps = dynamic([
+    "Add member to role",
+    "Add member to group",
+    "Update role",
+    "Add app role assignment to service principal",
+    "Add delegated permission grant",
+    "Set Company Information",
+    "Add owner to group"
+]);
+
+AuditLogs
+| where TimeGenerated > ago(24h)
+| where OperationName in (PrivilegeOps)
+| where Result == "success"
+| extend
+    HourUTC      = datetime_part("Hour", TimeGenerated),
+    HourPST      = (datetime_part("Hour", TimeGenerated) + 24 - 8) % 24,
+    DayOfWeek    = dayofweek(TimeGenerated) / 1d,   // 0=Sunday
+    InitiatedBy  = tostring(InitiatedBy.user.userPrincipalName),
+    TargetUser   = tostring(TargetResources[0].userPrincipalName),
+    TargetRole   = tostring(TargetResources[0].displayName),
+    ModifiedProp = tostring(TargetResources[0].modifiedProperties[0].newValue)
+| where
+    // Outside Mon–Fri 08:00–17:00 PST
+    DayOfWeek in (WeekendDays)
+    or HourPST < ChangeWindowStart
+    or HourPST >= ChangeWindowEnd
+| project
+    AlertTime        = TimeGenerated,
+    InitiatedBy,
+    TargetUser,
+    TargetRole,
+    OperationName,
+    HourPST,
+    DayOfWeek,
+    ModifiedProp
+| extend
+    Severity          = "HIGH",
+    RuleName          = "After-Hours Privilege Escalation",
+    HIPAAControl      = "§164.312(a)(1)",
+    MITRETechnique    = "T1078.004 / T1098",
+    RecommendedAction = "Verify with change manager. If no approved change ticket exists, revert assignment and escalate to Security Lead.",
+    IsWeekend         = DayOfWeek in (WeekendDays)
+| order by AlertTime desc

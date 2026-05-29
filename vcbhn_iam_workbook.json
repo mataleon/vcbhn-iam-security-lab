@@ -1,0 +1,410 @@
+"""
+VCBHN Quarterly Access Review Automation
+=========================================
+ValleyCrest Behavioral Health Network — IAM Security Operations
+Author: Leon Kiyonga | SentinelDrift
+GitHub: github.com/SentinelDrift
+
+Purpose:
+    Simulates a quarterly access certification review for a HIPAA-regulated
+    healthcare environment. Ingests a user roster, applies risk rules, and
+    generates a prioritized HTML report for the access review committee.
+
+Risk Rules Applied:
+    CRITICAL  — Stale account (90+ days inactive) with active PHI access
+    CRITICAL  — Account with no manager and PHI access (orphaned account)
+    CRITICAL  — Access review overdue 365+ days
+    HIGH      — Non-IT user with Admin role
+    HIGH      — Service/temp account with PHI access
+    HIGH      — Stale account (90+ days inactive), any access level
+    MEDIUM    — Access review overdue 180+ days
+    MEDIUM    — Facilities/non-clinical staff with PHI access
+    LOW       — Access review overdue 90+ days
+    INFO      — Account recently reviewed, no flags
+
+Compliance Mapping:
+    HIPAA Security Rule  — 45 CFR §164.308(a)(3) — Workforce Access Management
+    HIPAA Security Rule  — 45 CFR §164.308(a)(1) — Security Management Process
+    NIST SP 800-66 Rev 2 — AC-2 Account Management
+    NIST SP 800-66 Rev 2 — AC-6 Least Privilege
+"""
+
+import csv
+import datetime
+import os
+import sys
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+INPUT_FILE  = "mock_users.csv"
+OUTPUT_FILE = "vcbhn_access_review_report.html"
+ORG_NAME    = "ValleyCrest Behavioral Health Network"
+REVIEW_DATE = datetime.date.today().strftime("%B %d, %Y")
+
+NON_IT_ADMIN_DEPTS     = ["Nursing", "Billing", "Pharmacy", "HR", "Radiology",
+                           "Administration", "Finance", "Compliance", "Maintenance"]
+SERVICE_ACCOUNT_HINTS  = ["service.", "svc.", ".svc", "ghost.", "temp.", "test."]
+STALE_THRESHOLD_DAYS   = 90
+REVIEW_OVERDUE_DAYS    = {
+    "critical": 365,
+    "high":     180,
+    "medium":   90,
+}
+
+# ── RISK ENGINE ───────────────────────────────────────────────────────────────
+def evaluate_user(user):
+    """Apply risk rules to a single user record. Returns list of findings."""
+    findings = []
+    name    = user.get("display_name", "").strip()
+    dept    = user.get("department", "").strip()
+    phi     = user.get("phi_access", "").strip().upper() == "TRUE"
+    role    = user.get("role", "").strip()
+    inactive= int(user.get("last_login_days_ago", 0))
+    manager = user.get("manager", "").strip()
+    review  = int(user.get("last_access_review_days_ago", 0))
+    uid     = user.get("user_id", "").strip()
+    title   = user.get("job_title", "").strip()
+
+    is_service = any(hint in uid.lower() for hint in SERVICE_ACCOUNT_HINTS)
+    is_stale   = inactive >= STALE_THRESHOLD_DAYS
+
+    # CRITICAL: Stale + PHI access
+    if is_stale and phi:
+        findings.append({
+            "severity": "CRITICAL",
+            "rule":     "Stale Account with Active PHI Access",
+            "detail":   f"No login in {inactive} days — PHI access should be suspended pending review.",
+            "control":  "HIPAA §164.308(a)(3) | NIST AC-2"
+        })
+
+    # CRITICAL: Orphaned account (no manager, PHI access)
+    if not manager and phi:
+        findings.append({
+            "severity": "CRITICAL",
+            "rule":     "Orphaned Account with PHI Access",
+            "detail":   "Account has no assigned manager and retains PHI access. Cannot be certified.",
+            "control":  "HIPAA §164.308(a)(3) | NIST AC-2"
+        })
+
+    # CRITICAL: Access review overdue 365+ days
+    if review >= REVIEW_OVERDUE_DAYS["critical"]:
+        findings.append({
+            "severity": "CRITICAL",
+            "rule":     "Access Review Critically Overdue",
+            "detail":   f"Last reviewed {review} days ago — exceeds 365-day maximum threshold.",
+            "control":  "HIPAA §164.308(a)(1) | NIST AC-2"
+        })
+
+    # HIGH: Non-IT admin role
+    if role in ("Admin", "Global Admin") and dept in NON_IT_ADMIN_DEPTS:
+        findings.append({
+            "severity": "HIGH",
+            "rule":     "Non-IT User Assigned Admin Role",
+            "detail":   f"{dept} staff member holds '{role}' role — violates least-privilege principle.",
+            "control":  "HIPAA §164.312(a)(1) | NIST AC-6"
+        })
+
+    # HIGH: Service/temp account with PHI access
+    if is_service and phi:
+        findings.append({
+            "severity": "HIGH",
+            "rule":     "Service or Temp Account with PHI Access",
+            "detail":   "Non-person account retains PHI access — requires immediate justification or removal.",
+            "control":  "HIPAA §164.308(a)(3) | NIST AC-2"
+        })
+
+    # HIGH: Stale account (any)
+    if is_stale and not phi:
+        findings.append({
+            "severity": "HIGH",
+            "rule":     "Stale Account — No Recent Login",
+            "detail":   f"No login in {inactive} days — account should be disabled or removed.",
+            "control":  "NIST AC-2"
+        })
+
+    # MEDIUM: Review overdue 180+ days
+    if REVIEW_OVERDUE_DAYS["high"] <= review < REVIEW_OVERDUE_DAYS["critical"] and not any(
+        f["rule"] == "Access Review Critically Overdue" for f in findings
+    ):
+        findings.append({
+            "severity": "MEDIUM",
+            "rule":     "Access Review Overdue",
+            "detail":   f"Last reviewed {review} days ago — overdue for quarterly certification.",
+            "control":  "HIPAA §164.308(a)(1)"
+        })
+
+    # MEDIUM: Facilities/non-clinical with PHI access
+    if dept in ("Maintenance", "HR", "Finance") and phi:
+        findings.append({
+            "severity": "MEDIUM",
+            "rule":     "Non-Clinical Staff with PHI Access",
+            "detail":   f"{dept} staff with PHI access — verify business need is documented.",
+            "control":  "HIPAA §164.308(a)(3) | NIST AC-6"
+        })
+
+    # LOW: Review overdue 90+ days
+    if REVIEW_OVERDUE_DAYS["medium"] <= review < REVIEW_OVERDUE_DAYS["high"] and not any(
+        f["rule"] in ("Access Review Critically Overdue", "Access Review Overdue") for f in findings
+    ):
+        findings.append({
+            "severity": "LOW",
+            "rule":     "Access Review Due",
+            "detail":   f"Last reviewed {review} days ago — approaching overdue threshold.",
+            "control":  "HIPAA §164.308(a)(1)"
+        })
+
+    if not findings:
+        findings.append({
+            "severity": "INFO",
+            "rule":     "No Flags",
+            "detail":   "Account passed all review criteria.",
+            "control":  "—"
+        })
+
+    return findings
+
+
+def severity_rank(s):
+    return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}.get(s, 5)
+
+
+def severity_color(s):
+    return {
+        "CRITICAL": "#dc2626",
+        "HIGH":     "#ea580c",
+        "MEDIUM":   "#d97706",
+        "LOW":      "#2563eb",
+        "INFO":     "#16a34a",
+    }.get(s, "#6b7280")
+
+
+def severity_bg(s):
+    return {
+        "CRITICAL": "#fef2f2",
+        "HIGH":     "#fff7ed",
+        "MEDIUM":   "#fffbeb",
+        "LOW":      "#eff6ff",
+        "INFO":     "#f0fdf4",
+    }.get(s, "#f9fafb")
+
+
+# ── REPORT BUILDER ────────────────────────────────────────────────────────────
+def build_report(users, results):
+    total       = len(users)
+    critical_ct = sum(1 for r in results if any(f["severity"] == "CRITICAL" for f in r["findings"]))
+    high_ct     = sum(1 for r in results if any(f["severity"] == "HIGH"     for f in r["findings"]) and
+                                            not any(f["severity"] == "CRITICAL" for f in r["findings"]))
+    medium_ct   = sum(1 for r in results if r["top_severity"] == "MEDIUM")
+    low_ct      = sum(1 for r in results if r["top_severity"] == "LOW")
+    clean_ct    = sum(1 for r in results if r["top_severity"] == "INFO")
+
+    rows = ""
+    for r in results:
+        user     = r["user"]
+        findings = r["findings"]
+        top      = r["top_severity"]
+        phi_badge = (
+            '<span style="background:#fee2e2;color:#dc2626;padding:2px 8px;'
+            'border-radius:12px;font-size:11px;font-weight:600;">PHI</span>'
+            if user.get("phi_access","").upper() == "TRUE"
+            else '<span style="background:#f3f4f6;color:#6b7280;padding:2px 8px;'
+            'border-radius:12px;font-size:11px;">No PHI</span>'
+        )
+        role_badge = (
+            f'<span style="background:#fef9c3;color:#854d0e;padding:2px 8px;'
+            f'border-radius:12px;font-size:11px;font-weight:600;">{user["role"]}</span>'
+            if "Admin" in user.get("role","")
+            else f'<span style="background:#f1f5f9;color:#475569;padding:2px 8px;'
+            f'border-radius:12px;font-size:11px;">{user["role"]}</span>'
+        )
+        finding_rows = "".join(
+            f'<tr style="background:{severity_bg(f["severity"])};">'
+            f'<td style="padding:6px 10px;font-weight:700;color:{severity_color(f["severity"])};'
+            f'white-space:nowrap;">{f["severity"]}</td>'
+            f'<td style="padding:6px 10px;font-weight:600;">{f["rule"]}</td>'
+            f'<td style="padding:6px 10px;color:#374151;">{f["detail"]}</td>'
+            f'<td style="padding:6px 10px;color:#6b7280;font-size:11px;">{f["control"]}</td>'
+            f'</tr>'
+            for f in findings
+        )
+        rows += f"""
+        <tr style="border-top:2px solid {severity_color(top)};">
+          <td style="padding:10px 12px;font-weight:700;">{user['user_id']}</td>
+          <td style="padding:10px 12px;">{user['display_name'] or '<em style="color:#9ca3af">No Name</em>'}</td>
+          <td style="padding:10px 12px;color:#6b7280;">{user['department'] or '—'}</td>
+          <td style="padding:10px 12px;">{phi_badge}</td>
+          <td style="padding:10px 12px;">{role_badge}</td>
+          <td style="padding:10px 12px;color:#6b7280;">{user['last_login_days_ago']}d ago</td>
+          <td style="padding:10px 12px;">
+            <span style="font-weight:700;color:{severity_color(top)};">{top}</span>
+          </td>
+        </tr>
+        <tr>
+          <td colspan="7" style="padding:0 12px 14px 12px;background:#f9fafb;">
+            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+              <tr style="background:#e5e7eb;">
+                <th style="padding:5px 10px;text-align:left;width:90px;">Severity</th>
+                <th style="padding:5px 10px;text-align:left;width:240px;">Rule</th>
+                <th style="padding:5px 10px;text-align:left;">Detail</th>
+                <th style="padding:5px 10px;text-align:left;width:220px;">Control</th>
+              </tr>
+              {finding_rows}
+            </table>
+          </td>
+        </tr>
+        """
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>VCBHN Quarterly Access Review Report</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background:#f1f5f9; margin:0; padding:24px; color:#111827; }}
+    .container {{ max-width:1200px; margin:0 auto; }}
+    .header {{ background:linear-gradient(135deg,#0D1B2A 0%,#1B7A84 100%);
+               color:#fff; padding:32px 36px; border-radius:12px 12px 0 0; }}
+    .header h1 {{ margin:0 0 6px; font-size:26px; letter-spacing:1px; }}
+    .header p  {{ margin:0; color:#a5f3fc; font-size:13px; }}
+    .meta {{ background:#fff; padding:16px 36px; border-bottom:1px solid #e5e7eb;
+             display:flex; gap:32px; font-size:13px; color:#6b7280; }}
+    .meta span b {{ color:#111827; }}
+    .scorecards {{ display:grid; grid-template-columns:repeat(5,1fr); gap:16px;
+                   padding:24px 0 16px; }}
+    .card {{ background:#fff; border-radius:10px; padding:20px 16px; text-align:center;
+             border-top:4px solid; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+    .card .num {{ font-size:36px; font-weight:800; }}
+    .card .lbl {{ font-size:12px; color:#6b7280; margin-top:4px; text-transform:uppercase;
+                  letter-spacing:.5px; }}
+    .section-title {{ font-size:13px; font-weight:700; color:#6b7280; letter-spacing:1px;
+                      text-transform:uppercase; margin:24px 0 10px; }}
+    table.main {{ width:100%; border-collapse:collapse; background:#fff;
+                  border-radius:10px; overflow:hidden;
+                  box-shadow:0 1px 3px rgba(0,0,0,.08); font-size:13px; }}
+    table.main th {{ background:#0D1B2A; color:#e2e8f0; padding:12px 12px;
+                     text-align:left; font-size:12px; text-transform:uppercase;
+                     letter-spacing:.5px; }}
+    .footer {{ margin-top:32px; font-size:11px; color:#9ca3af; text-align:center;
+               padding-bottom:24px; }}
+    .hipaa-note {{ background:#fffbeb; border:1px solid #fcd34d; border-radius:8px;
+                   padding:12px 16px; font-size:12px; color:#92400e; margin-bottom:16px; }}
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>🏥 VCBHN Quarterly Access Review Report</h1>
+    <p>{ORG_NAME} &nbsp;·&nbsp; Generated: {REVIEW_DATE} &nbsp;·&nbsp;
+       HIPAA §164.308(a)(3) Workforce Access Management</p>
+  </div>
+  <div class="meta">
+    <span><b>Scope:</b> All Active Accounts</span>
+    <span><b>Total Accounts Reviewed:</b> {total}</span>
+    <span><b>Review Period:</b> Quarterly Certification</span>
+    <span><b>Classification:</b> CONFIDENTIAL — Internal Use Only</span>
+  </div>
+
+  <div class="scorecards">
+    <div class="card" style="border-color:#dc2626;">
+      <div class="num" style="color:#dc2626;">{critical_ct}</div>
+      <div class="lbl">Critical</div>
+    </div>
+    <div class="card" style="border-color:#ea580c;">
+      <div class="num" style="color:#ea580c;">{high_ct}</div>
+      <div class="lbl">High</div>
+    </div>
+    <div class="card" style="border-color:#d97706;">
+      <div class="num" style="color:#d97706;">{medium_ct}</div>
+      <div class="lbl">Medium</div>
+    </div>
+    <div class="card" style="border-color:#2563eb;">
+      <div class="num" style="color:#2563eb;">{low_ct}</div>
+      <div class="lbl">Low</div>
+    </div>
+    <div class="card" style="border-color:#16a34a;">
+      <div class="num" style="color:#16a34a;">{clean_ct}</div>
+      <div class="lbl">Passed</div>
+    </div>
+  </div>
+
+  <div class="hipaa-note">
+    ⚠️ <b>HIPAA Notice:</b> This report contains information subject to
+    HIPAA Security Rule requirements. Access is restricted to authorized
+    personnel involved in workforce security administration.
+    Handle per VCBHN Information Security Policy ISP-007.
+  </div>
+
+  <div class="section-title">Account Risk Summary — Sorted by Severity</div>
+  <table class="main">
+    <thead>
+      <tr>
+        <th>User ID</th><th>Display Name</th><th>Department</th>
+        <th>PHI Access</th><th>Role</th><th>Last Login</th><th>Top Risk</th>
+      </tr>
+    </thead>
+    <tbody>{rows}</tbody>
+  </table>
+
+  <div class="footer">
+    Generated by VCBHN Access Review Automation &nbsp;·&nbsp;
+    SentinelDrift Portfolio &nbsp;·&nbsp; github.com/SentinelDrift/vcbhn-iam-security-lab<br/>
+    HIPAA §164.308(a)(3) · NIST SP 800-66 Rev 2 · AC-2 · AC-6
+  </div>
+</div>
+</body>
+</html>"""
+    return html
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_path = os.path.join(script_dir, INPUT_FILE)
+
+    print(f"\n{'='*60}")
+    print(f"  VCBHN Quarterly Access Review")
+    print(f"  {ORG_NAME}")
+    print(f"  {REVIEW_DATE}")
+    print(f"{'='*60}\n")
+
+    with open(input_path, newline="", encoding="utf-8") as f:
+        users = list(csv.DictReader(f))
+
+    results = []
+    for user in users:
+        findings = evaluate_user(user)
+        top      = min(findings, key=lambda x: severity_rank(x["severity"]))["severity"]
+        results.append({"user": user, "findings": findings, "top_severity": top})
+
+    results.sort(key=lambda r: severity_rank(r["top_severity"]))
+
+    # Console summary
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for r in results:
+        counts[r["top_severity"]] += 1
+        flag_str = " | ".join(f["rule"] for f in r["findings"] if f["severity"] != "INFO")
+        status   = f"  [{r['top_severity']:<8}] {r['user']['display_name'] or r['user']['user_id']:<28}"
+        if flag_str:
+            print(status + f"→ {flag_str}")
+        else:
+            print(status + "✓ Passed")
+
+    print(f"\n{'─'*60}")
+    print(f"  SUMMARY: {len(users)} accounts reviewed")
+    for sev, cnt in counts.items():
+        if cnt:
+            print(f"  {sev:<10} {cnt}")
+    print(f"{'─'*60}\n")
+
+    # HTML report
+    html     = build_report(users, results)
+    out_path = os.path.join(script_dir, OUTPUT_FILE)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"  ✅ Report saved → {OUTPUT_FILE}\n")
+
+
+if __name__ == "__main__":
+    main()

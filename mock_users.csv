@@ -1,0 +1,88 @@
+// ============================================================
+// VCBHN IAM Detection | Rule: Bulk Permission Changes
+// ============================================================
+// Description:
+//   Detects when a single admin account makes an abnormally
+//   high volume of permission or role assignment changes within
+//   a short time window. In a healthcare IAM environment,
+//   bulk changes are rare and may indicate:
+//     - Compromised admin account performing mass access grant
+//     - Insider threat expanding access before exfiltration
+//     - Unauthorized automation script running against directory
+//
+// Severity:      HIGH
+// MITRE ATT&CK:  T1098 — Account Manipulation
+//                T1078 — Valid Accounts
+// HIPAA Control: §164.312(a)(1) — Access Control
+//                §164.308(a)(1) — Security Management Process
+// NIST SP 800-66: AC-2 | AU-6 Audit Review
+//
+// Threshold:     5+ changes within 10 minutes by one initiator
+// Response:      Immediately review all changes made. If no
+//                approved change ticket, suspend admin account
+//                and escalate to HIPAA Security Officer.
+// ============================================================
+
+let TimeWindowMinutes = 10;
+let ChangeThreshold   = 5;
+
+let PermissionOps = dynamic([
+    "Add member to role",
+    "Add member to group",
+    "Remove member from role",
+    "Remove member from group",
+    "Add delegated permission grant",
+    "Remove delegated permission grant",
+    "Add app role assignment to service principal",
+    "Update role"
+]);
+
+AuditLogs
+| where TimeGenerated > ago(1h)
+| where OperationName in (PermissionOps)
+| where Result == "success"
+| extend
+    InitiatedBy = tostring(InitiatedBy.user.userPrincipalName),
+    TargetUser  = tostring(TargetResources[0].userPrincipalName),
+    TargetRole  = tostring(TargetResources[0].displayName)
+| where isnotempty(InitiatedBy)
+// Bin into 10-minute windows
+| summarize
+    ChangeCount  = count(),
+    Operations   = make_set(OperationName),
+    TargetUsers  = make_set(TargetUser),
+    TargetRoles  = make_set(TargetRole),
+    FirstChange  = min(TimeGenerated),
+    LastChange   = max(TimeGenerated)
+    by InitiatedBy, bin(TimeGenerated, TimeWindowMinutes * 1m)
+| where ChangeCount >= ChangeThreshold
+| extend
+    DurationSeconds = datetime_diff('second', LastChange, FirstChange),
+    Severity        = case(
+                        ChangeCount >= 20, "CRITICAL",
+                        ChangeCount >= 10, "HIGH",
+                        "MEDIUM"
+                      ),
+    RuleName        = "Bulk IAM Permission Changes",
+    HIPAAControl    = "§164.312(a)(1) | §164.308(a)(1)",
+    MITRETechnique  = "T1098 / T1078",
+    RecommendedAction = strcat(
+        "Review all ", tostring(ChangeCount),
+        " changes by ", InitiatedBy,
+        ". Verify against approved change ticket. ",
+        "Revert unauthorized changes and suspend account if no ticket found."
+    )
+| project
+    AlertTime    = TimeGenerated,
+    InitiatedBy,
+    ChangeCount,
+    DurationSeconds,
+    Operations,
+    TargetUsers,
+    TargetRoles,
+    Severity,
+    RuleName,
+    HIPAAControl,
+    MITRETechnique,
+    RecommendedAction
+| order by ChangeCount desc
